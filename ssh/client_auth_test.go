@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -104,11 +105,44 @@ func tryAuthBothSides(t *testing.T, config *ClientConfig, gssAPIWithMICConfig *G
 	return err, serverAuthErrors
 }
 
+type loggingAlgorithmSigner struct {
+	used []string
+	AlgorithmSigner
+}
+
+func (l *loggingAlgorithmSigner) Sign(rand io.Reader, data []byte) (*Signature, error) {
+	l.used = append(l.used, "[Sign]")
+	return l.AlgorithmSigner.Sign(rand, data)
+}
+
+func (l *loggingAlgorithmSigner) SignWithAlgorithm(rand io.Reader, data []byte, algorithm string) (*Signature, error) {
+	l.used = append(l.used, algorithm)
+	return l.AlgorithmSigner.SignWithAlgorithm(rand, data, algorithm)
+}
+
 func TestClientAuthPublicKey(t *testing.T) {
+	signer := &loggingAlgorithmSigner{AlgorithmSigner: testSigners["rsa"].(AlgorithmSigner)}
 	config := &ClientConfig{
 		User: "testuser",
 		Auth: []AuthMethod{
-			PublicKeys(testSigners["rsa"]),
+			PublicKeys(signer),
+		},
+		HostKeyCallback: InsecureIgnoreHostKey(),
+	}
+	if err := tryAuth(t, config); err != nil {
+		t.Fatalf("unable to dial remote side: %s", err)
+	}
+	if len(signer.used) != 1 || signer.used[0] != KeyAlgoRSASHA256 {
+		t.Errorf("unexpected Sign/SignWithAlgorithm calls: %q", signer.used)
+	}
+}
+
+// TestClientAuthNoSHA2 tests a ssh-rsa Signer that doesn't implement AlgorithmSigner.
+func TestClientAuthNoSHA2(t *testing.T) {
+	config := &ClientConfig{
+		User: "testuser",
+		Auth: []AuthMethod{
+			PublicKeys(&legacyRSASigner{testSigners["rsa"]}),
 		},
 		HostKeyCallback: InsecureIgnoreHostKey(),
 	}
@@ -117,72 +151,20 @@ func TestClientAuthPublicKey(t *testing.T) {
 	}
 }
 
-func TestClientAuthPublicKeyExtensions(t *testing.T) {
-	c1, c2, err := netPipe()
-	if err != nil {
-		t.Fatalf("netPipe: %v", err)
-	}
-	defer c1.Close()
-	defer c2.Close()
-
-	certChecker := CertChecker{
-		IsUserAuthority: func(k PublicKey) bool {
-			return bytes.Equal(k.Marshal(), testPublicKeys["ecdsa"].Marshal())
-		},
-		UserKeyFallback: func(conn ConnMetadata, key PublicKey) (*Permissions, error) {
-			if conn.User() == "testuser" && bytes.Equal(key.Marshal(), testPublicKeys["rsa"].Marshal()) {
-				return nil, nil
-			}
-
-			return nil, fmt.Errorf("pubkey for %q not acceptable", conn.User())
-		},
-		IsRevoked: func(c *Certificate) bool {
-			return c.Serial == 666
-		},
-	}
-	serverConfig := &ServerConfig{
-		PublicKeyCallback: certChecker.Authenticate,
-	}
-	serverConfig.AddHostKey(testSigners["rsa"])
-
-	go newServer(c1, serverConfig)
-	clientConn, _, _, err := NewClientConn(c2, "", &ClientConfig{
+// TestClientAuthThirdKey checks that the third configured can succeed. If we
+// were to do three attempts for each key (rsa-sha2-256, rsa-sha2-512, ssh-rsa),
+// we'd hit the six maximum attempts before reaching it.
+func TestClientAuthThirdKey(t *testing.T) {
+	config := &ClientConfig{
 		User: "testuser",
 		Auth: []AuthMethod{
-			PublicKeys(testSigners["rsa"]),
+			PublicKeys(testSigners["rsa-openssh-format"],
+				testSigners["rsa-openssh-format"], testSigners["rsa"]),
 		},
 		HostKeyCallback: InsecureIgnoreHostKey(),
-	})
-	if err != nil {
-		t.Fatalf("NewClientConn: %v", err)
 	}
-
-	conn, ok := clientConn.(*connection)
-	if !ok {
-		t.Fatalf("conn is not a *connection")
-	}
-
-	rawServerSigAlgs, ok := conn.transport.extensions[ExtServerSigAlgs]
-	if !ok {
-		t.Fatalf("did not receive server-sig-algs extension")
-	}
-
-	serverSigAlgs := strings.Split(string(rawServerSigAlgs), ",")
-	if len(serverSigAlgs) == 0 {
-		t.Fatalf("did not receive any server-sig-algs")
-	}
-
-	for _, expectedAlg := range supportedSigAlgs() {
-		hasAlg := false
-		for _, receivedAlg := range serverSigAlgs {
-			if receivedAlg == expectedAlg {
-				hasAlg = true
-				break
-			}
-		}
-		if !hasAlg {
-			t.Errorf("server-sig-algs did not have expected alg: %s", expectedAlg)
-		}
+	if err := tryAuth(t, config); err != nil {
+		t.Fatalf("unable to dial remote side: %s", err)
 	}
 }
 
@@ -197,65 +179,6 @@ func TestAuthMethodPassword(t *testing.T) {
 
 	if err := tryAuth(t, config); err != nil {
 		t.Fatalf("unable to dial remote side: %s", err)
-	}
-}
-
-func TestClientAuthPasswordExtensions(t *testing.T) {
-	c1, c2, err := netPipe()
-	if err != nil {
-		t.Fatalf("netPipe: %v", err)
-	}
-	defer c1.Close()
-	defer c2.Close()
-
-	serverConfig := &ServerConfig{
-		PasswordCallback: func(conn ConnMetadata, pass []byte) (*Permissions, error) {
-			if conn.User() == "testuser" && string(pass) == clientPassword {
-				return nil, nil
-			}
-			return nil, errors.New("password auth failed")
-		},
-	}
-	serverConfig.AddHostKey(testSigners["rsa"])
-
-	go newServer(c1, serverConfig)
-	clientConn, _, _, err := NewClientConn(c2, "", &ClientConfig{
-		User: "testuser",
-		Auth: []AuthMethod{
-			Password(clientPassword),
-		},
-		HostKeyCallback: InsecureIgnoreHostKey(),
-	})
-	if err != nil {
-		t.Fatalf("NewClientConn: %v", err)
-	}
-
-	conn, ok := clientConn.(*connection)
-	if !ok {
-		t.Fatalf("conn is not a *connection")
-	}
-
-	rawServerSigAlgs, ok := conn.transport.extensions[ExtServerSigAlgs]
-	if !ok {
-		t.Fatalf("did not receive server-sig-algs extension")
-	}
-
-	serverSigAlgs := strings.Split(string(rawServerSigAlgs), ",")
-	if len(serverSigAlgs) == 0 {
-		t.Fatalf("did not receive any server-sig-algs")
-	}
-
-	for _, expectedAlg := range supportedSigAlgs() {
-		hasAlg := false
-		for _, receivedAlg := range serverSigAlgs {
-			if receivedAlg == expectedAlg {
-				hasAlg = true
-				break
-			}
-		}
-		if !hasAlg {
-			t.Errorf("server-sig-algs did not have expected alg: %s", expectedAlg)
-		}
 	}
 }
 
@@ -767,7 +690,15 @@ func TestClientAuthMaxAuthTriesPublicKey(t *testing.T) {
 	if err := tryAuth(t, invalidConfig); err == nil {
 		t.Fatalf("client: got no error, want %s", expectedErr)
 	} else if err.Error() != expectedErr.Error() {
-		t.Fatalf("client: got %s, want %s", err, expectedErr)
+		// On Windows we can see a WSAECONNABORTED error
+		// if the client writes another authentication request
+		// before the client goroutine reads the disconnection
+		// message.  See issue 50805.
+		if runtime.GOOS == "windows" && strings.Contains(err.Error(), "wsarecv: An established connection was aborted") {
+			// OK.
+		} else {
+			t.Fatalf("client: got %s, want %s", err, expectedErr)
+		}
 	}
 }
 

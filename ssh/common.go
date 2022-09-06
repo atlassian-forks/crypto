@@ -24,21 +24,13 @@ const (
 	serviceSSH      = "ssh-connection"
 )
 
-// These are string constants related to extensions and extension negotiation
+// These are string constants related to extensions and extension negotiation.
+// See RFC 8308
 const (
-	extInfoServer = "ext-info-s"
-	extInfoClient = "ext-info-c"
-
-	ExtServerSigAlgs = "server-sig-algs"
-	// extDelayCompression = "delay-compression"
-	// extNoFlowControl    = "no-flow-control"
-	// extElevation        = "elevation"
+	extInfoServer    = "ext-info-s"
+	extInfoClient    = "ext-info-c"
+	extServerSigAlgs = "server-sig-algs"
 )
-
-// defaultExtensions lists extensions enabled by default.
-var defaultExtensions = []string{
-	ExtServerSigAlgs,
-}
 
 // supportedCiphers lists ciphers we support but might not recommend.
 var supportedCiphers = []string{
@@ -60,11 +52,11 @@ var preferredCiphers = []string{
 // supportedKexAlgos specifies the supported key-exchange algorithms in
 // preference order.
 var supportedKexAlgos = []string{
-	kexAlgoCurve25519SHA256,
+	kexAlgoCurve25519SHA256, kexAlgoCurve25519SHA256LibSSH,
 	// P384 and P521 are not constant-time yet, but since we don't
 	// reuse ephemeral keys, using them for ECDH should be OK.
 	kexAlgoECDH256, kexAlgoECDH384, kexAlgoECDH521,
-	kexAlgoDH14SHA1, kexAlgoDH1SHA1,
+	kexAlgoDH14SHA256, kexAlgoDH14SHA1, kexAlgoDH1SHA1,
 }
 
 // serverForbiddenKexAlgos contains key exchange algorithms, that are forbidden
@@ -77,18 +69,20 @@ var serverForbiddenKexAlgos = map[string]struct{}{
 // preferredKexAlgos specifies the default preference for key-exchange algorithms
 // in preference order.
 var preferredKexAlgos = []string{
-	kexAlgoCurve25519SHA256,
+	kexAlgoCurve25519SHA256, kexAlgoCurve25519SHA256LibSSH,
 	kexAlgoECDH256, kexAlgoECDH384, kexAlgoECDH521,
-	kexAlgoDH14SHA1,
+	kexAlgoDH14SHA256, kexAlgoDH14SHA1,
 }
 
 // supportedHostKeyAlgos specifies the supported host-key algorithms (i.e. methods
 // of authenticating servers) in preference order.
 var supportedHostKeyAlgos = []string{
+	CertAlgoRSASHA512v01, CertAlgoRSASHA256v01,
 	CertAlgoRSAv01, CertAlgoDSAv01, CertAlgoECDSA256v01,
 	CertAlgoECDSA384v01, CertAlgoECDSA521v01, CertAlgoED25519v01,
 
 	KeyAlgoECDSA256, KeyAlgoECDSA384, KeyAlgoECDSA521,
+	KeyAlgoRSASHA512, KeyAlgoRSASHA256,
 	KeyAlgoRSA, KeyAlgoDSA,
 
 	KeyAlgoED25519,
@@ -103,31 +97,42 @@ var supportedMACs = []string{
 
 var supportedCompressions = []string{compressionNone}
 
-// hashFuncs keeps the mapping of supported algorithms to their respective
-// hashes needed for signature verification.
-var hashFuncs = map[string]crypto.Hash{
-	KeyAlgoRSA:          crypto.SHA1,
-	KeyAlgoDSA:          crypto.SHA1,
-	KeyAlgoECDSA256:     crypto.SHA256,
-	KeyAlgoECDSA384:     crypto.SHA384,
-	KeyAlgoECDSA521:     crypto.SHA512,
-	CertAlgoRSAv01:      crypto.SHA1,
-	CertAlgoDSAv01:      crypto.SHA1,
-	CertAlgoECDSA256v01: crypto.SHA256,
-	CertAlgoECDSA384v01: crypto.SHA384,
-	CertAlgoECDSA521v01: crypto.SHA512,
+// supportedServerSigAlgs defines the algorithms supported for pubkey authentication.
+// Order should not matter, but to avoid any issues we use the same order as OpenSSH.
+// See RFC 8308, Section 3.1.
+var supportedServerSigAlgs = []string{KeyAlgoED25519, KeyAlgoSKED25519,
+	KeyAlgoRSA, KeyAlgoRSASHA256, KeyAlgoRSASHA512,
+	KeyAlgoDSA, KeyAlgoECDSA256, KeyAlgoECDSA384, KeyAlgoECDSA521,
+	KeyAlgoSKECDSA256,
 }
 
-// supportedSigAlgs returns a slice of algorithms supported for pubkey authentication
-// in no particular order.
-func supportedSigAlgs() []string {
-	// TODO(kxd) I'm not sure if hashFuncs is the best place to get this set but it seemed
-	// like a sensible first step. Should this be a curated list?
-	var serverSigAlgs []string
-	for k := range hashFuncs {
-		serverSigAlgs = append(serverSigAlgs, k)
+// hashFuncs keeps the mapping of supported signature algorithms to their
+// respective hashes needed for signing and verification.
+var hashFuncs = map[string]crypto.Hash{
+	KeyAlgoRSA:       crypto.SHA1,
+	KeyAlgoRSASHA256: crypto.SHA256,
+	KeyAlgoRSASHA512: crypto.SHA512,
+	KeyAlgoDSA:       crypto.SHA1,
+	KeyAlgoECDSA256:  crypto.SHA256,
+	KeyAlgoECDSA384:  crypto.SHA384,
+	KeyAlgoECDSA521:  crypto.SHA512,
+	// KeyAlgoED25519 doesn't pre-hash.
+	KeyAlgoSKECDSA256: crypto.SHA256,
+	KeyAlgoSKED25519:  crypto.SHA256,
+}
+
+// algorithmsForKeyFormat returns the supported signature algorithms for a given
+// public key format (PublicKey.Type), in order of preference. See RFC 8332,
+// Section 2. See also the note in sendKexInit on backwards compatibility.
+func algorithmsForKeyFormat(keyFormat string) []string {
+	switch keyFormat {
+	case KeyAlgoRSA:
+		return []string{KeyAlgoRSASHA256, KeyAlgoRSASHA512, KeyAlgoRSA}
+	case CertAlgoRSAv01:
+		return []string{CertAlgoRSASHA256v01, CertAlgoRSASHA512v01, CertAlgoRSAv01}
+	default:
+		return []string{keyFormat}
 	}
-	return serverSigAlgs
 }
 
 // unexpectedMessageError results when the SSH message that we received didn't
@@ -141,6 +146,31 @@ func parseError(tag uint8) error {
 	return fmt.Errorf("ssh: parse error in message type %d", tag)
 }
 
+// parseExtInfoMsg returns the extensions from an extInfoMsg packet.
+// packet must be an already validated extInfoMsg
+func parseExtInfoMsg(packet []byte) (map[string][]byte, error) {
+	extensions := make(map[string][]byte)
+	var extInfo extInfoMsg
+
+	if err := Unmarshal(packet, &extInfo); err != nil {
+		return nil, err
+	}
+	payload := extInfo.Payload
+	for i := uint32(0); i < extInfo.NumExtensions; i++ {
+		name, rest, ok := parseString(payload)
+		if !ok {
+			return nil, parseError(msgExtInfo)
+		}
+		value, rest, ok := parseString(rest)
+		if !ok {
+			return nil, parseError(msgExtInfo)
+		}
+		extensions[string(name)] = value
+		payload = rest
+	}
+	return extensions, nil
+}
+
 func findCommon(what string, client []string, server []string) (common string, err error) {
 	for _, c := range client {
 		for _, s := range server {
@@ -150,16 +180,6 @@ func findCommon(what string, client []string, server []string) (common string, e
 		}
 	}
 	return "", fmt.Errorf("ssh: no common algorithm for %s; client offered: %v, server offered: %v", what, client, server)
-}
-
-// hasString returns true if string "a" is in slice of strings "x", false otherwise.
-func hasString(a string, x []string) bool {
-	for _, s := range x {
-		if a == s {
-			return true
-		}
-	}
-	return false
 }
 
 // directionAlgorithms records algorithm choices in one direction (either read or write)
@@ -184,6 +204,11 @@ func (a *directionAlgorithms) rekeyBytes() int64 {
 	return 1 << 30
 }
 
+var aeadCiphers = map[string]bool{
+	gcmCipherID:        true,
+	chacha20Poly1305ID: true,
+}
+
 type algorithms struct {
 	kex     string
 	hostKey string
@@ -200,8 +225,7 @@ func findAgreedAlgorithms(isClient bool, clientKexInit, serverKexInit *kexInitMs
 	} else if result.kex == extInfoClient || result.kex == extInfoServer {
 		// According to RFC8308 section 2.2 if either the client or server extension signal
 		// is chosen as the kex algorithm the parties must disconnect.
-		// chosen
-		return result, fmt.Errorf("ssh: invalid kex algorithm chosen")
+		return result, fmt.Errorf("ssh: invalid kex algorithm chosen: %s", result.kex)
 	}
 
 	result.hostKey, err = findCommon("host key", clientKexInit.ServerHostKeyAlgos, serverKexInit.ServerHostKeyAlgos)
@@ -224,14 +248,18 @@ func findAgreedAlgorithms(isClient bool, clientKexInit, serverKexInit *kexInitMs
 		return
 	}
 
-	ctos.MAC, err = findCommon("client to server MAC", clientKexInit.MACsClientServer, serverKexInit.MACsClientServer)
-	if err != nil {
-		return
+	if !aeadCiphers[ctos.Cipher] {
+		ctos.MAC, err = findCommon("client to server MAC", clientKexInit.MACsClientServer, serverKexInit.MACsClientServer)
+		if err != nil {
+			return
+		}
 	}
 
-	stoc.MAC, err = findCommon("server to client MAC", clientKexInit.MACsServerClient, serverKexInit.MACsServerClient)
-	if err != nil {
-		return
+	if !aeadCiphers[stoc.Cipher] {
+		stoc.MAC, err = findCommon("server to client MAC", clientKexInit.MACsServerClient, serverKexInit.MACsServerClient)
+		if err != nil {
+			return
+		}
 	}
 
 	ctos.Compression, err = findCommon("client to server compression", clientKexInit.CompressionClientServer, serverKexInit.CompressionClientServer)
@@ -275,10 +303,6 @@ type Config struct {
 	// The allowed MAC algorithms. If unspecified then a sensible default
 	// is used.
 	MACs []string
-
-	// A list of enabled extensions. If unspecified then a sensible
-	// default is used
-	Extensions []string
 }
 
 // SetDefaults sets sensible values for unset fields in config. This is
@@ -308,10 +332,6 @@ func (c *Config) SetDefaults() {
 		c.MACs = supportedMACs
 	}
 
-	if c.Extensions == nil {
-		c.Extensions = defaultExtensions
-	}
-
 	if c.RekeyThreshold == 0 {
 		// cipher specific default
 	} else if c.RekeyThreshold < minRekeyThreshold {
@@ -323,8 +343,9 @@ func (c *Config) SetDefaults() {
 }
 
 // buildDataSignedForAuth returns the data that is signed in order to prove
-// possession of a private key. See RFC 4252, section 7.
-func buildDataSignedForAuth(sessionID []byte, req userAuthRequestMsg, algo, pubKey []byte) []byte {
+// possession of a private key. See RFC 4252, section 7. algo is the advertised
+// algorithm, and may be a certificate type.
+func buildDataSignedForAuth(sessionID []byte, req userAuthRequestMsg, algo string, pubKey []byte) []byte {
 	data := struct {
 		Session []byte
 		Type    byte
@@ -332,7 +353,7 @@ func buildDataSignedForAuth(sessionID []byte, req userAuthRequestMsg, algo, pubK
 		Service string
 		Method  string
 		Sign    bool
-		Algo    []byte
+		Algo    string
 		PubKey  []byte
 	}{
 		sessionID,

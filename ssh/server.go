@@ -120,7 +120,7 @@ type ServerConfig struct {
 }
 
 // AddHostKey adds a private key as a host key. If an existing host
-// key exists with the same algorithm, it is overwritten. Each server
+// key exists with the same public key format, it is replaced. Each server
 // config must have at least one host key.
 func (s *ServerConfig) AddHostKey(key Signer) {
 	for i, k := range s.hostKeys {
@@ -212,9 +212,10 @@ func NewServerConn(c net.Conn, config *ServerConfig) (*ServerConn, <-chan NewCha
 }
 
 // signAndMarshal signs the data with the appropriate algorithm,
-// and serializes the result in SSH wire format.
-func signAndMarshal(k Signer, rand io.Reader, data []byte) ([]byte, error) {
-	sig, err := k.Sign(rand, data)
+// and serializes the result in SSH wire format. algo is the negotiate
+// algorithm and may be a certificate type.
+func signAndMarshal(k AlgorithmSigner, rand io.Reader, data []byte, algo string) ([]byte, error) {
+	sig, err := k.SignWithAlgorithm(rand, data, underlyingAlgo(algo))
 	if err != nil {
 		return nil, err
 	}
@@ -255,35 +256,31 @@ func (s *connection) serverHandshake(config *ServerConfig) (*Permissions, error)
 	// We just did the key change, so the session ID is established.
 	s.sessionID = s.transport.getSessionID()
 
-	var serviceRequest serviceRequestMsg
-readServiceRequestLoop:
-	for {
-		var packet []byte
+	// the client could send a SSH_MSG_EXT_INFO after the first SSH_MSG_NEWKEYS
+	// and so before SSH_MSG_SERVICE_REQUEST. See RFC 8308, Section 2.4.
+	var packet []byte
+	if packet, err = s.transport.readPacket(); err != nil {
+		return nil, err
+	}
+
+	if len(packet) > 0 && packet[0] == msgExtInfo {
+		// read SSH_MSG_EXT_INFO
+		if _, err := parseExtInfoMsg(packet); err != nil {
+			return nil, err
+		}
+		// read the next packet
 		if packet, err = s.transport.readPacket(); err != nil {
 			return nil, err
 		}
-
-		switch packet[0] {
-		case msgExtInfo:
-			var extInfo extInfoMsg
-			if err := Unmarshal(packet, &extInfo); err != nil {
-				return nil, err
-			}
-			s.transport.extensions = extInfo.Extensions
-			continue
-		case msgServiceRequest:
-			if err = Unmarshal(packet, &serviceRequest); err != nil {
-				return nil, err
-			}
-			if serviceRequest.Service != serviceUserAuth {
-				return nil, errors.New("ssh: requested service '" + serviceRequest.Service + "' before authenticating")
-			}
-			break readServiceRequestLoop
-		default:
-			return nil, fmt.Errorf("ssh: unexpected message received")
-		}
 	}
 
+	var serviceRequest serviceRequestMsg
+	if err = Unmarshal(packet, &serviceRequest); err != nil {
+		return nil, err
+	}
+	if serviceRequest.Service != serviceUserAuth {
+		return nil, errors.New("ssh: requested service '" + serviceRequest.Service + "' before authenticating")
+	}
 	serviceAccept := serviceAcceptMsg{
 		Service: serviceUserAuth,
 	}
@@ -301,8 +298,9 @@ readServiceRequestLoop:
 
 func isAcceptableAlgo(algo string) bool {
 	switch algo {
-	case KeyAlgoRSA, KeyAlgoDSA, KeyAlgoECDSA256, KeyAlgoECDSA384, KeyAlgoECDSA521, KeyAlgoSKECDSA256, KeyAlgoED25519, KeyAlgoSKED25519,
-		CertAlgoRSAv01, CertAlgoDSAv01, CertAlgoECDSA256v01, CertAlgoECDSA384v01, CertAlgoECDSA521v01, CertAlgoSKECDSA256v01, CertAlgoED25519v01, CertAlgoSKED25519v01:
+	case KeyAlgoRSA, KeyAlgoRSASHA256, KeyAlgoRSASHA512, KeyAlgoDSA, KeyAlgoECDSA256, KeyAlgoECDSA384, KeyAlgoECDSA521, KeyAlgoSKECDSA256, KeyAlgoED25519, KeyAlgoSKED25519,
+		CertAlgoRSAv01, CertAlgoDSAv01, CertAlgoECDSA256v01, CertAlgoECDSA384v01, CertAlgoECDSA521v01, CertAlgoSKECDSA256v01, CertAlgoED25519v01, CertAlgoSKED25519v01,
+		CertAlgoRSASHA256v01, CertAlgoRSASHA512v01:
 		return true
 	}
 	return false
@@ -570,6 +568,7 @@ userAuthLoop:
 				if !ok || len(payload) > 0 {
 					return nil, parseError(msgUserAuthRequest)
 				}
+
 				// Ensure the public key algo and signature algo
 				// are supported.  Compare the private key
 				// algorithm name that corresponds to algo with
@@ -579,7 +578,12 @@ userAuthLoop:
 					authErr = fmt.Errorf("ssh: algorithm %q not accepted", sig.Format)
 					break
 				}
-				signedData := buildDataSignedForAuth(sessionID, userAuthReq, algoBytes, pubKeyData)
+				if underlyingAlgo(algo) != sig.Format {
+					authErr = fmt.Errorf("ssh: signature %q not compatible with selected algorithm %q", sig.Format, algo)
+					break
+				}
+
+				signedData := buildDataSignedForAuth(sessionID, userAuthReq, algo, pubKeyData)
 
 				if err := pubKey.Verify(signedData, sig); err != nil {
 					return nil, err
@@ -650,6 +654,30 @@ userAuthLoop:
 		}
 
 		authFailures++
+		if config.MaxAuthTries > 0 && authFailures >= config.MaxAuthTries {
+			// If we have hit the max attempts, don't bother sending the
+			// final SSH_MSG_USERAUTH_FAILURE message, since there are
+			// no more authentication methods which can be attempted,
+			// and this message may cause the client to re-attempt
+			// authentication while we send the disconnect message.
+			// Continue, and trigger the disconnect at the start of
+			// the loop.
+			//
+			// The SSH specification is somewhat confusing about this,
+			// RFC 4252 Section 5.1 requires each authentication failure
+			// be responded to with a respective SSH_MSG_USERAUTH_FAILURE
+			// message, but Section 4 says the server should disconnect
+			// after some number of attempts, but it isn't explicit which
+			// message should take precedence (i.e. should there be a failure
+			// message than a disconnect message, or if we are going to
+			// disconnect, should we only send that message.)
+			//
+			// Either way, OpenSSH disconnects immediately after the last
+			// failed authnetication attempt, and given they are typically
+			// considered the golden implementation it seems reasonable
+			// to match that behavior.
+			continue
+		}
 
 		var failureMsg userAuthFailureMsg
 		if config.PasswordCallback != nil {
@@ -675,14 +703,6 @@ userAuthLoop:
 		}
 	}
 
-	// TODO(kxd) This is where the second ext info message was being sent as per
-	// RFC8308 section 2.4, but OpenSSH 8.8's client doesn't seem to like it. It
-	// thinks it's an unexpected packet for some reason. It seems like all the
-	// server implementations I've been able to find so far don't actually send
-	// this message, so it's probably fine to not have it. There aren't currently
-	// any extension values you'd want to hide from anonymous users at this point
-	// anyway, as far as I'm aware.
-
 	if err := s.transport.writePacket([]byte{msgUserAuthSuccess}); err != nil {
 		return nil, err
 	}
@@ -695,7 +715,7 @@ type sshClientKeyboardInteractive struct {
 	*connection
 }
 
-func (c *sshClientKeyboardInteractive) Challenge(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
+func (c *sshClientKeyboardInteractive) Challenge(name, instruction string, questions []string, echos []bool) (answers []string, err error) {
 	if len(questions) != len(echos) {
 		return nil, errors.New("ssh: echos and questions must have equal length")
 	}
@@ -707,6 +727,7 @@ func (c *sshClientKeyboardInteractive) Challenge(user, instruction string, quest
 	}
 
 	if err := c.transport.writePacket(Marshal(&userAuthInfoRequestMsg{
+		Name:        name,
 		Instruction: instruction,
 		NumPrompts:  uint32(len(questions)),
 		Prompts:     prompts,
